@@ -75,8 +75,7 @@ jobs:
         env:
           LZMA_API_STATIC: "1"
         run: |
-              cargo install cross
-              cross build --release --locked --target ${{ matrix.target }} --package zb_cli
+              cargo build --release --locked --target ${{ matrix.target }} --package zb_cli
 
 
       - name: Verify no dynamic liblzma dependency (macOS)
