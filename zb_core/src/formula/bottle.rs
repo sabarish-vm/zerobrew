@@ -1,3 +1,6 @@
+use std::path::Path;
+
+use crate::formula::types::BottleFile;
 use crate::{Error, Formula};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5,9 +8,85 @@ pub struct SelectedBottle {
     pub tag: String,
     pub url: String,
     pub sha256: String,
+    /// The bottle's `cellar` value from the formula API; see [`BottleFile::cellar`].
+    pub cellar: Option<String>,
+}
+
+impl SelectedBottle {
+    fn from_file(tag: impl Into<String>, file: &BottleFile) -> Self {
+        Self {
+            tag: tag.into(),
+            url: file.url.clone(),
+            sha256: file.sha256.clone(),
+            cellar: file.cellar.clone(),
+        }
+    }
+
+    /// The Homebrew prefix the bottle was built in, i.e. the one its hardcoded
+    /// paths point to. Relocatable bottles (`:any`, `:any_skip_relocation`)
+    /// were built in the platform's default prefix.
+    pub fn build_prefix(&self) -> &str {
+        match self.pinned_cellar() {
+            Some(cellar) => cellar.strip_suffix("/Cellar").unwrap_or(cellar),
+            None => default_homebrew_prefix(),
+        }
+    }
+
+    /// Whether the bottle can be poured into `prefix`. Bottles pinned to a
+    /// Cellar keep hardcoded paths in their binaries, which can only be
+    /// rewritten in place, so `prefix` can't be longer than the one they were
+    /// built for. Homebrew builds these from source instead.
+    pub fn is_pourable_into(&self, prefix: &Path) -> bool {
+        match self.pinned_cellar() {
+            Some(_) => prefix.as_os_str().len() <= self.build_prefix().len(),
+            None => true,
+        }
+    }
+
+    fn pinned_cellar(&self) -> Option<&str> {
+        self.cellar
+            .as_deref()
+            .filter(|cellar| cellar.starts_with('/'))
+    }
+}
+
+/// Where Homebrew installs by default on this platform, which is where its
+/// bottles are built.
+pub fn default_homebrew_prefix() -> &'static str {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "/opt/homebrew"
+    } else if cfg!(target_os = "macos") {
+        "/usr/local"
+    } else {
+        "/home/linuxbrew/.linuxbrew"
+    }
 }
 
 const MACOS_CODENAMES_NEWEST_FIRST: &[&str] = &["tahoe", "sequoia", "sonoma", "ventura"];
+
+#[cfg(any(target_os = "linux", test))]
+fn preferred_linux_bottle_tags_for_arch(arch: &str) -> &'static [&'static str] {
+    match arch {
+        "aarch64" => &["arm64_linux", "aarch64_linux"],
+        "x86_64" => &["x86_64_linux"],
+        _ => &[],
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn preferred_linux_bottle_tags() -> &'static [&'static str] {
+    preferred_linux_bottle_tags_for_arch(std::env::consts::ARCH)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_compatible_linux_bottle_tag_for_arch(tag: &str, arch: &str) -> bool {
+    preferred_linux_bottle_tags_for_arch(arch).contains(&tag)
+}
+
+#[cfg(target_os = "linux")]
+fn is_compatible_linux_bottle_tag(tag: &str) -> bool {
+    is_compatible_linux_bottle_tag_for_arch(tag, std::env::consts::ARCH)
+}
 
 #[cfg(target_os = "macos")]
 pub fn macos_major_version() -> Option<u32> {
@@ -66,11 +145,7 @@ fn select_bottle_with_version(
 
         for tag in &tags {
             if let Some(file) = formula.bottle.stable.files.get(tag.as_str()) {
-                return Ok(SelectedBottle {
-                    tag: tag.clone(),
-                    url: file.url.clone(),
-                    sha256: file.sha256.clone(),
-                });
+                return Ok(SelectedBottle::from_file(tag.clone(), file));
             }
         }
     }
@@ -81,35 +156,22 @@ fn select_bottle_with_version(
 
         for tag in &tags {
             if let Some(file) = formula.bottle.stable.files.get(*tag) {
-                return Ok(SelectedBottle {
-                    tag: tag.to_string(),
-                    url: file.url.clone(),
-                    sha256: file.sha256.clone(),
-                });
+                return Ok(SelectedBottle::from_file(tag.to_string(), file));
             }
         }
     }
 
     #[cfg(target_os = "linux")]
     {
-        let linux_tags = ["x86_64_linux"];
-        for preferred_tag in linux_tags {
+        for &preferred_tag in preferred_linux_bottle_tags() {
             if let Some(file) = formula.bottle.stable.files.get(preferred_tag) {
-                return Ok(SelectedBottle {
-                    tag: preferred_tag.to_string(),
-                    url: file.url.clone(),
-                    sha256: file.sha256.clone(),
-                });
+                return Ok(SelectedBottle::from_file(preferred_tag.to_string(), file));
             }
         }
     }
 
     if let Some(file) = formula.bottle.stable.files.get("all") {
-        return Ok(SelectedBottle {
-            tag: "all".to_string(),
-            url: file.url.clone(),
-            sha256: file.sha256.clone(),
-        });
+        return Ok(SelectedBottle::from_file("all".to_string(), file));
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -119,11 +181,7 @@ fn select_bottle_with_version(
             if tag.starts_with("arm64_") && !tag.contains("linux") {
                 let bare = tag.strip_prefix("arm64_").unwrap_or(tag);
                 if codenames.contains(&bare) {
-                    return Ok(SelectedBottle {
-                        tag: tag.clone(),
-                        url: file.url.clone(),
-                        sha256: file.sha256.clone(),
-                    });
+                    return Ok(SelectedBottle::from_file(tag.clone(), file));
                 }
             }
         }
@@ -135,11 +193,7 @@ fn select_bottle_with_version(
         for (tag, file) in &formula.bottle.stable.files {
             if !tag.starts_with("arm64_") && !tag.contains("linux") && tag != "all" {
                 if codenames.contains(&tag.as_str()) {
-                    return Ok(SelectedBottle {
-                        tag: tag.clone(),
-                        url: file.url.clone(),
-                        sha256: file.sha256.clone(),
-                    });
+                    return Ok(SelectedBottle::from_file(tag.clone(), file));
                 }
             }
         }
@@ -147,12 +201,8 @@ fn select_bottle_with_version(
 
     #[cfg(target_os = "linux")]
     for (tag, file) in &formula.bottle.stable.files {
-        if tag.contains("linux") {
-            return Ok(SelectedBottle {
-                tag: tag.clone(),
-                url: file.url.clone(),
-                sha256: file.sha256.clone(),
-            });
+        if is_compatible_linux_bottle_tag(tag) {
+            return Ok(SelectedBottle::from_file(tag.clone(), file));
         }
     }
 
@@ -215,6 +265,34 @@ mod tests {
     }
 
     #[test]
+    fn linux_arm_prefers_arm64_bottle_tags() {
+        assert_eq!(
+            preferred_linux_bottle_tags_for_arch("aarch64"),
+            &["arm64_linux", "aarch64_linux"]
+        );
+    }
+
+    #[test]
+    fn linux_x86_64_prefers_x86_64_bottle_tags() {
+        assert_eq!(
+            preferred_linux_bottle_tags_for_arch("x86_64"),
+            &["x86_64_linux"]
+        );
+    }
+
+    #[test]
+    fn linux_fallback_rejects_cross_arch_bottle_tags() {
+        assert!(!is_compatible_linux_bottle_tag_for_arch(
+            "x86_64_linux",
+            "aarch64"
+        ));
+        assert!(!is_compatible_linux_bottle_tag_for_arch(
+            "arm64_linux",
+            "x86_64"
+        ));
+    }
+
+    #[test]
     fn selects_all_bottle_for_universal_packages() {
         let mut files = BTreeMap::new();
         files.insert(
@@ -223,6 +301,7 @@ mod tests {
                 url: "https://ghcr.io/v2/homebrew/core/ca-certificates/blobs/sha256:abc123"
                     .to_string(),
                 sha256: "abc123".to_string(),
+                cellar: None,
             },
         );
 
@@ -262,6 +341,7 @@ mod tests {
                 url: "https://example.com/legacy.tar.gz".to_string(),
                 sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                     .to_string(),
+                cellar: None,
             },
         );
 
@@ -303,6 +383,7 @@ mod tests {
                 url: "https://example.com/legacy.tar.gz".to_string(),
                 sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
+                cellar: None,
             },
         );
 
@@ -379,6 +460,7 @@ mod tests {
             BottleFile {
                 url: "https://example.com/tahoe.tar.gz".to_string(),
                 sha256: "aaaa".repeat(16),
+                cellar: None,
             },
         );
         files.insert(
@@ -386,6 +468,7 @@ mod tests {
             BottleFile {
                 url: "https://example.com/sequoia.tar.gz".to_string(),
                 sha256: "bbbb".repeat(16),
+                cellar: None,
             },
         );
 
@@ -428,6 +511,7 @@ mod tests {
             BottleFile {
                 url: "https://example.com/tahoe.tar.gz".to_string(),
                 sha256: "aaaa".repeat(16),
+                cellar: None,
             },
         );
         files.insert(
@@ -435,6 +519,7 @@ mod tests {
             BottleFile {
                 url: "https://example.com/sequoia.tar.gz".to_string(),
                 sha256: "bbbb".repeat(16),
+                cellar: None,
             },
         );
 
@@ -466,5 +551,56 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         assert_eq!(selected.tag, "all");
+    }
+
+    fn bottle_with_cellar(cellar: Option<&str>) -> SelectedBottle {
+        SelectedBottle {
+            tag: "arm64_tahoe".to_string(),
+            url: "https://example.com/foo.tar.gz".to_string(),
+            sha256: "aaaa".repeat(16),
+            cellar: cellar.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pinned_bottle_build_prefix_comes_from_its_cellar() {
+        assert_eq!(
+            bottle_with_cellar(Some("/opt/homebrew/Cellar")).build_prefix(),
+            "/opt/homebrew"
+        );
+        assert_eq!(
+            bottle_with_cellar(Some("/usr/local/Cellar")).build_prefix(),
+            "/usr/local"
+        );
+    }
+
+    #[test]
+    fn relocatable_bottle_build_prefix_is_the_platform_default() {
+        for cellar in [Some(":any"), Some(":any_skip_relocation"), None] {
+            assert_eq!(
+                bottle_with_cellar(cellar).build_prefix(),
+                default_homebrew_prefix()
+            );
+        }
+    }
+
+    #[test]
+    fn relocatable_bottles_pour_into_any_prefix() {
+        let long_prefix = Path::new("/a/much/longer/prefix/than/homebrew/uses");
+        for cellar in [Some(":any"), Some(":any_skip_relocation"), None] {
+            assert!(bottle_with_cellar(cellar).is_pourable_into(long_prefix));
+        }
+    }
+
+    #[test]
+    fn pinned_bottles_only_pour_into_prefixes_that_fit() {
+        let arm = bottle_with_cellar(Some("/opt/homebrew/Cellar"));
+        assert!(arm.is_pourable_into(Path::new("/opt/zerobrew")));
+        assert!(arm.is_pourable_into(Path::new("/opt/zb")));
+        assert!(!arm.is_pourable_into(Path::new("/opt/zerobrew/prefix")));
+
+        let intel = bottle_with_cellar(Some("/usr/local/Cellar"));
+        assert!(!intel.is_pourable_into(Path::new("/opt/zerobrew")));
+        assert!(intel.is_pourable_into(Path::new("/usr/local")));
     }
 }

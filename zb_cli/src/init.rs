@@ -74,8 +74,13 @@ pub fn run_init(
             ui.info("Path-sensitive packages (e.g. git, curl) will fail to install.")?;
             ui.info(format!(
                 "Consider a shorter prefix, e.g.: {}",
-                style("zb init <root> /opt/zerobrew").cyan(),
+                style(format!(
+                    "zb --root {} --prefix /opt/zerobrew init",
+                    root.display()
+                ))
+                .cyan(),
             ))?;
+            ui.info("If this came from old shell config, unset ZEROBREW_PREFIX and rerun init.")?;
             ui.blank_line()?;
         }
     }
@@ -220,6 +225,24 @@ fn upsert_managed_block(existing: &str, managed_block: &str) -> String {
     }
 }
 
+fn posix_shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn fish_shell_quote(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+    )
+}
+
 fn add_to_path(
     prefix: &Path,
     zerobrew_dir: &str,
@@ -228,6 +251,7 @@ fn add_to_path(
     no_modify_path: bool,
     ui: &mut StdUi,
 ) -> Result<(), InitError> {
+    #[derive(Clone, Copy)]
     enum ShellConfigKind {
         Posix,
         Fish,
@@ -266,7 +290,18 @@ fn add_to_path(
     };
 
     let prefix_bin = prefix.join("bin");
-    let existing_config = std::fs::read_to_string(&config_file).unwrap_or_default();
+    let root_str = root.display().to_string();
+    let prefix_str = prefix.display().to_string();
+    let prefix_bin_str = prefix_bin.display().to_string();
+    // Treat only a missing file as an empty config. Any other read error
+    // (for example non-UTF-8 content) must not read as empty: the write
+    // below truncates, and that would replace the user's shell config
+    // with only the managed block.
+    let existing_config = match std::fs::read_to_string(&config_file) {
+        Ok(contents) => Ok(contents),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    };
 
     if !no_modify_path {
         let block_body = match shell_kind {
@@ -318,18 +353,18 @@ _zb_path_append() {{
 _zb_path_append "$ZEROBREW_BIN"
 _zb_path_append "$ZEROBREW_PREFIX/bin"
 "#,
-                zerobrew_dir = zerobrew_dir,
-                zerobrew_bin = zerobrew_bin,
-                root = root.display(),
-                prefix = prefix.display()
+                zerobrew_dir = posix_shell_quote(zerobrew_dir),
+                zerobrew_bin = posix_shell_quote(zerobrew_bin),
+                root = posix_shell_quote(&root_str),
+                prefix = posix_shell_quote(&prefix_str)
             ),
             ShellConfigKind::Fish => format!(
                 r#"
 # zerobrew
-set -gx ZEROBREW_DIR "{zerobrew_dir}"
-set -gx ZEROBREW_BIN "{zerobrew_bin}"
-set -gx ZEROBREW_ROOT "{root}"
-set -gx ZEROBREW_PREFIX "{prefix}"
+set -gx ZEROBREW_DIR {zerobrew_dir}
+set -gx ZEROBREW_BIN {zerobrew_bin}
+set -gx ZEROBREW_ROOT {root}
+set -gx ZEROBREW_PREFIX {prefix}
 if set -q PKG_CONFIG_PATH
     set -gx PKG_CONFIG_PATH "$ZEROBREW_PREFIX/lib/pkgconfig" $PKG_CONFIG_PATH
 else
@@ -370,13 +405,26 @@ if not contains -- "$ZEROBREW_PREFIX/bin" $PATH
     set -gx PATH "$ZEROBREW_PREFIX/bin" $PATH
 end
 "#,
-                zerobrew_dir = zerobrew_dir,
-                zerobrew_bin = zerobrew_bin,
-                root = root.display(),
-                prefix = prefix.display()
+                zerobrew_dir = fish_shell_quote(zerobrew_dir),
+                zerobrew_bin = fish_shell_quote(zerobrew_bin),
+                root = fish_shell_quote(&root_str),
+                prefix = fish_shell_quote(&prefix_str)
             ),
         };
         let managed_block = format!("{ZB_BLOCK_START}{block_body}\n{ZB_BLOCK_END}\n");
+        let existing_config = match existing_config {
+            Ok(contents) => contents,
+            Err(e) => {
+                // Never truncate a file we could not read back.
+                ui.note(format!(
+                    "Could not read {} due to error: {}",
+                    config_file, e
+                ))?;
+                ui.info(format!("Please add the following to {}:", config_file))?;
+                ui.info(&managed_block)?;
+                return Ok(());
+            }
+        };
         let updated_config = upsert_managed_block(&existing_config, &managed_block);
 
         if let Some(parent) = std::path::Path::new(&config_file).parent() {
@@ -410,14 +458,56 @@ end
                 zerobrew_bin,
                 prefix_bin.display()
             ))?;
+            let reload_command = match shell_kind {
+                ShellConfigKind::Posix => format!(". {}", posix_shell_quote(&config_file)),
+                ShellConfigKind::Fish => format!("source {}", fish_shell_quote(&config_file)),
+            };
+            ui.info(format!("Restart your terminal or run: {}", reload_command))?;
         }
     } else if no_modify_path {
         ui.info("Skipped shell configuration (--no-modify-path)")?;
-        ui.info(format!(
-            "To use zerobrew, add {} and {} to your PATH",
-            zerobrew_bin,
-            prefix_bin.display()
-        ))?;
+        match shell_kind {
+            ShellConfigKind::Posix => {
+                ui.info("Run this in your current shell:")?;
+                ui.println(format!(
+                    "    export ZEROBREW_DIR={}",
+                    posix_shell_quote(zerobrew_dir)
+                ))?;
+                ui.println(format!(
+                    "    export ZEROBREW_ROOT={}",
+                    posix_shell_quote(&root_str)
+                ))?;
+                ui.println(format!(
+                    "    export ZEROBREW_PREFIX={}",
+                    posix_shell_quote(&prefix_str)
+                ))?;
+                ui.println(format!(
+                    "    export PATH={}:{}:$PATH",
+                    posix_shell_quote(zerobrew_bin),
+                    posix_shell_quote(&prefix_bin_str)
+                ))?;
+            }
+            ShellConfigKind::Fish => {
+                ui.info("Run this in your current shell:")?;
+                ui.println(format!(
+                    "    set -gx ZEROBREW_DIR {}",
+                    fish_shell_quote(zerobrew_dir)
+                ))?;
+                ui.println(format!(
+                    "    set -gx ZEROBREW_ROOT {}",
+                    fish_shell_quote(&root_str)
+                ))?;
+                ui.println(format!(
+                    "    set -gx ZEROBREW_PREFIX {}",
+                    fish_shell_quote(&prefix_str)
+                ))?;
+                ui.println(format!(
+                    "    set -gx PATH {} {} $PATH",
+                    fish_shell_quote(zerobrew_bin),
+                    fish_shell_quote(&prefix_bin_str)
+                ))?;
+            }
+        }
     }
 
     Ok(())
@@ -507,6 +597,22 @@ mod tests {
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn posix_shell_quote_preserves_spaces_and_single_quotes() {
+        assert_eq!(
+            posix_shell_quote("/tmp/zero brew/user's dir"),
+            "'/tmp/zero brew/user'\\''s dir'"
+        );
+    }
+
+    #[test]
+    fn fish_shell_quote_escapes_expansions() {
+        assert_eq!(
+            fish_shell_quote(r#"/tmp/zero brew/$root/"bin""#),
+            r#""/tmp/zero brew/\$root/\"bin\"""#
+        );
     }
 
     #[test]
@@ -612,10 +718,10 @@ mod tests {
         let content = fs::read_to_string(&shell_config).unwrap();
         assert!(content.contains(ZB_BLOCK_START));
         assert!(content.contains(ZB_BLOCK_END));
-        assert!(content.contains("export ZEROBREW_DIR=/home/user/.zerobrew"));
-        assert!(content.contains("export ZEROBREW_BIN=/home/user/.zerobrew/bin"));
-        assert!(content.contains(&format!("export ZEROBREW_ROOT={}", root.display())));
-        assert!(content.contains(&format!("export ZEROBREW_PREFIX={}", prefix.display())));
+        assert!(content.contains("export ZEROBREW_DIR='/home/user/.zerobrew'"));
+        assert!(content.contains("export ZEROBREW_BIN='/home/user/.zerobrew/bin'"));
+        assert!(content.contains(&format!("export ZEROBREW_ROOT='{}'", root.display())));
+        assert!(content.contains(&format!("export ZEROBREW_PREFIX='{}'", prefix.display())));
         assert!(content.contains("export PKG_CONFIG_PATH="));
         assert!(content.contains("/lib/pkgconfig"));
         assert!(
@@ -750,10 +856,40 @@ mod tests {
         // Managed block should be replaced, preserving unrelated user content
         let content = fs::read_to_string(&shell_config).unwrap();
         assert!(content.contains("export KEEP_ME=true"));
-        assert!(content.contains("export ZEROBREW_DIR=/home/user/.zerobrew"));
+        assert!(content.contains("export ZEROBREW_DIR='/home/user/.zerobrew'"));
         assert!(!content.contains("export ZEROBREW_DIR=/old"));
         assert_eq!(content.matches(ZB_BLOCK_START).count(), 1);
         assert_eq!(content.matches(ZB_BLOCK_END).count(), 1);
+    }
+
+    #[test]
+    fn add_to_path_preserves_config_it_cannot_read() {
+        let _lock = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let prefix = tmp.path().join("prefix");
+        let root = tmp.path().join("root");
+        let shell_config = home.join(".bashrc");
+        let zerobrew_dir = "/home/user/.zerobrew";
+        let zerobrew_bin = "/home/user/.zerobrew/bin";
+
+        fs::create_dir(&prefix).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        // Non-UTF-8 content: read_to_string fails with InvalidData.
+        let original: &[u8] = b"# caf\xe9 config\nexport KEEP_ME=true\n";
+        fs::write(&shell_config, original).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", home.to_str().unwrap());
+            std::env::set_var("SHELL", "/bin/bash");
+        }
+
+        add_to_path(&prefix, zerobrew_dir, zerobrew_bin, &root, false).unwrap();
+
+        // A config that cannot be read back must stay untouched.
+        let after = fs::read(&shell_config).unwrap();
+        assert_eq!(after, original);
     }
 
     #[test]

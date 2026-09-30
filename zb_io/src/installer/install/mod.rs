@@ -4,12 +4,12 @@ mod outdated;
 mod plan;
 mod source;
 mod uninstall;
+mod upgrade;
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fs4::fs_std::FileExt;
 use tracing::warn;
 
 use crate::cellar::link::Linker;
@@ -27,6 +27,21 @@ use zb_core::{Error, Formula, InstallMethod};
 use bottle::dependency_cellar_path;
 
 const MAX_CORRUPTION_RETRIES: usize = 3;
+
+/// Acquire the cross-process install lock. The returned `File` must be kept
+/// alive (e.g. `let _lock = ...`) for the duration the lock should be held —
+/// dropping it releases the flock. Re-acquiring in the same process while the
+/// guard is alive would deadlock, so multi-step flows (e.g. `upgrade`) take
+/// the lock once and call the no-lock `execute_inner` directly.
+pub(crate) fn acquire_install_lock(locks_dir: &Path) -> Result<File, Error> {
+    let lock_path = locks_dir.join("install.lock");
+    let lock_file =
+        File::create(&lock_path).map_err(Error::store("failed to create install lock"))?;
+    lock_file
+        .lock()
+        .map_err(Error::store("failed to acquire install lock"))?;
+    Ok(lock_file)
+}
 
 pub struct Installer {
     api_client: ApiClient,
@@ -49,6 +64,12 @@ pub struct PlannedInstall {
 #[derive(Debug)]
 pub struct InstallPlan {
     pub items: Vec<PlannedInstall>,
+}
+
+#[derive(Debug)]
+pub struct PlanFailure {
+    pub name: String,
+    pub error: Error,
 }
 
 pub struct ExecuteResult {
@@ -107,14 +128,19 @@ impl Installer {
         link: bool,
         progress: Option<Arc<ProgressCallback>>,
     ) -> Result<ExecuteResult, Error> {
-        let lock_path = self.locks_dir.join("install.lock");
-        let lock_file =
-            File::create(&lock_path).map_err(Error::store("failed to create install lock"))?;
-        lock_file
-            .lock_exclusive()
-            .map_err(Error::store("failed to acquire install lock"))?;
-        let _lock = lock_file;
+        let _lock = acquire_install_lock(&self.locks_dir)?;
+        self.execute_inner(plan, link, progress).await
+    }
 
+    /// No-lock variant of `execute_with_progress`. Callers MUST already hold
+    /// the install lock — used by `upgrade` to compose uninstall + install
+    /// under a single lock acquisition.
+    pub(crate) async fn execute_inner(
+        &mut self,
+        plan: InstallPlan,
+        link: bool,
+        progress: Option<Arc<ProgressCallback>>,
+    ) -> Result<ExecuteResult, Error> {
         let report = |event: InstallProgress| {
             if let Some(ref cb) = progress {
                 cb(event);
@@ -343,6 +369,19 @@ pub fn create_installer(
 #[cfg(test)]
 mod test_support {
     pub fn create_bottle_tarball(formula_name: &str) -> Vec<u8> {
+        create_bottle_tarball_with_version(formula_name, "1.0.0")
+    }
+
+    pub fn create_bottle_tarball_with_version(formula_name: &str, version: &str) -> Vec<u8> {
+        create_bottle_tarball_with_files(formula_name, version, &[])
+    }
+
+    /// A bottle with `bin/<name>` plus extra `(path in keg, contents)` files.
+    pub fn create_bottle_tarball_with_files(
+        formula_name: &str,
+        version: &str,
+        extra_files: &[(&str, &str)],
+    ) -> Vec<u8> {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         use std::io::Write;
@@ -350,16 +389,24 @@ mod test_support {
 
         let mut builder = Builder::new(Vec::new());
 
-        let mut header = tar::Header::new_gnu();
-        header
-            .set_path(format!("{}/1.0.0/bin/{}", formula_name, formula_name))
-            .unwrap();
-        header.set_size(20);
-        header.set_mode(0o755);
-        header.set_cksum();
+        let content = format!("#!/bin/sh\necho {} v{}", formula_name, version);
+        let files = std::iter::once((format!("bin/{formula_name}"), content.as_str(), 0o755))
+            .chain(
+                extra_files
+                    .iter()
+                    .map(|(path, contents)| (path.to_string(), *contents, 0o644)),
+            );
 
-        let content = format!("#!/bin/sh\necho {}", formula_name);
-        builder.append(&header, content.as_bytes()).unwrap();
+        for (path, contents, mode) in files {
+            let mut header = tar::Header::new_gnu();
+            header
+                .set_path(format!("{}/{}/{}", formula_name, version, path))
+                .unwrap();
+            header.set_size(contents.len() as u64);
+            header.set_mode(mode);
+            header.set_cksum();
+            builder.append(&header, contents.as_bytes()).unwrap();
+        }
 
         let tar_data = builder.into_inner().unwrap();
 
@@ -372,7 +419,7 @@ mod test_support {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(data);
-        format!("{:x}", hasher.finalize())
+        crate::checksum::sha256_hex(hasher)
     }
 
     pub fn get_test_bottle_tag() -> &'static str {
@@ -684,6 +731,104 @@ mod tests {
         assert!(root.join("cellar/goodpkg/1.0.0").exists());
     }
 
+    /// An installer backed by a mock API serving `name` 1.0.0 as `bottle`.
+    async fn installer_for_bottle(
+        mock_server: &MockServer,
+        tmp: &TempDir,
+        name: &str,
+        bottle: Vec<u8>,
+    ) -> (Installer, std::path::PathBuf, std::path::PathBuf) {
+        let tag = get_test_bottle_tag();
+        let formula_json = format!(
+            r#"{{
+                "name": "{name}",
+                "versions": {{ "stable": "1.0.0" }},
+                "dependencies": [],
+                "bottle": {{ "stable": {{ "files": {{
+                    "{tag}": {{
+                        "url": "{uri}/bottles/{name}-1.0.0.{tag}.bottle.tar.gz",
+                        "sha256": "{sha}"
+                    }}
+                }} }} }}
+            }}"#,
+            uri = mock_server.uri(),
+            sha = sha256_hex(&bottle),
+        );
+
+        Mock::given(method("GET"))
+            .and(path(format!("/formula/{name}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&formula_json))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/bottles/{name}-1.0.0.{tag}.bottle.tar.gz")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bottle))
+            .mount(mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let installer = Installer::new(
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap(),
+            BlobCache::new(&root.join("cache")).unwrap(),
+            Store::new(&root).unwrap(),
+            Cellar::new(&root).unwrap(),
+            Linker::new(&prefix).unwrap(),
+            Database::open(&root.join("db/zb.sqlite3")).unwrap(),
+            prefix.clone(),
+            root.join("locks"),
+        );
+        (installer, root, prefix)
+    }
+
+    #[tokio::test]
+    async fn install_copies_bottle_etc_files_into_prefix() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let bottle = create_bottle_tarball_with_files(
+            "withconf",
+            "1.0.0",
+            &[(".bottle/etc/withconf/withconf.conf", "setting = 1\n")],
+        );
+        let (mut installer, _root, prefix) =
+            installer_for_bottle(&mock_server, &tmp, "withconf", bottle).await;
+
+        installer
+            .install(&["withconf".to_string()], true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(prefix.join("etc/withconf/withconf.conf")).unwrap(),
+            "setting = 1\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn etc_install_failure_fails_install_and_cleans_keg() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let bottle = create_bottle_tarball_with_files(
+            "badconf",
+            "1.0.0",
+            &[(".bottle/etc/badconf/badconf.conf", "setting = 1\n")],
+        );
+        let (mut installer, root, prefix) =
+            installer_for_bottle(&mock_server, &tmp, "badconf", bottle).await;
+
+        // A file where the config directory needs to go.
+        fs::write(prefix.join("etc/badconf"), "in the way").unwrap();
+
+        let result = installer.install(&["badconf".to_string()], true).await;
+
+        assert!(result.is_err());
+        assert!(installer.db.get_installed("badconf").is_none());
+        assert!(!root.join("cellar/badconf/1.0.0").exists());
+        assert!(!prefix.join("bin/badconf").exists());
+    }
+
     #[tokio::test]
     async fn db_persist_failure_cleans_materialized_and_linked_files() {
         let mock_server = MockServer::start().await;
@@ -780,7 +925,7 @@ class Terraform < Formula
   version "1.10.0"
   bottle do
     root_url "{}/v2/hashicorp/tap"
-    sha256 {}: "{}"
+    sha256 cellar: :any_skip_relocation, {}: "{}"
   end
 end
 "#,

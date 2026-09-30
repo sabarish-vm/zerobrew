@@ -5,17 +5,76 @@ use std::path::{Component, Path, PathBuf};
 use zb_core::{ConflictedLink, Error};
 
 const LINK_DIRS: &[&str] = &["bin", "lib", "libexec", "include", "share", "etc"];
-const LIBEXEC_SKIP_FILES: &[&str] = &[".gitignore", "pyvenv.cfg"];
+const PYVENV_CFG: &str = "pyvenv.cfg";
+const LIBEXEC_SKIP_FILES: &[&str] = &[".gitignore", PYVENV_CFG];
 
 fn should_skip_link_entry(src_dir: &Path, entry_name: &std::ffi::OsStr) -> bool {
-    // Homebrew-style Python virtualenv formulae commonly place metadata files at
-    // libexec/.gitignore and libexec/pyvenv.cfg. Linking these into a shared
-    // prefix/libexec causes cross-formula conflicts (e.g. ranger vs ansible-lint)
-    // even though they are not executable entrypoints users need on PATH.
-    src_dir.file_name().and_then(|n| n.to_str()) == Some("libexec")
-        && entry_name
+    // Homebrew-style Python virtualenv formulae bundle an isolated venv under
+    // libexec/. The main executable is exposed via bin/<name> symlinks that
+    // resolve into libexec/ within the keg itself, so nothing inside libexec/
+    // is meant for the shared prefix. Linking libexec/ contents into the
+    // shared prefix/libexec/ causes cross-formula conflicts:
+    //   - libexec/{pyvenv.cfg, .gitignore} (metadata)
+    //   - libexec/lib*/python3.X/site-packages/ (private dep trees)
+    //   - libexec/bin/<shared-dep> (e.g. sqlformat across mycli + pgcli)
+    let is_libexec_dir = src_dir.file_name().and_then(|n| n.to_str()) == Some("libexec");
+
+    if is_libexec_dir {
+        // Detect a virtualenv libexec by the presence of pyvenv.cfg alongside;
+        // when present, skip every entry — including libexec/bin/ — so private
+        // venv contents never leak into the shared prefix.
+        if src_dir.join(PYVENV_CFG).exists() {
+            return true;
+        }
+        if entry_name
             .to_str()
             .is_some_and(|name| LIBEXEC_SKIP_FILES.contains(&name))
+        {
+            return true;
+        }
+    }
+
+    entry_name.to_str() == Some("site-packages") && is_libexec_python_lib_dir(src_dir)
+}
+
+fn is_libexec_python_lib_dir(path: &Path) -> bool {
+    let mut in_libexec = false;
+    let mut previous_was_python_lib = false;
+
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            previous_was_python_lib = false;
+            continue;
+        };
+        let Some(name) = name.to_str() else {
+            previous_was_python_lib = false;
+            continue;
+        };
+
+        if name == "libexec" {
+            in_libexec = true;
+            previous_was_python_lib = false;
+            continue;
+        }
+
+        if !in_libexec {
+            continue;
+        }
+
+        if previous_was_python_lib && is_python_version_dir(name) {
+            return true;
+        }
+
+        previous_was_python_lib = matches!(name, "lib" | "lib64");
+    }
+
+    false
+}
+
+fn is_python_version_dir(name: &str) -> bool {
+    name.strip_prefix("python")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_ascii_digit())
 }
 
 pub struct Linker {
@@ -43,15 +102,62 @@ fn keg_name_from_path(path: &Path) -> Option<String> {
     None
 }
 
-fn keg_name_from_symlink(dst: &Path) -> Option<String> {
+/// Strip `.` and resolve `..` components without touching the filesystem, so
+/// dangling symlink targets can still be attributed to a keg.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Read the symlink at `dst` and resolve a relative target against its parent
+/// directory. Returns `None` when `dst` is not a symlink.
+fn resolve_link_target(dst: &Path) -> Option<PathBuf> {
     let target = fs::read_link(dst).ok()?;
-    let resolved = if target.is_relative() {
+    Some(if target.is_relative() {
         dst.parent().unwrap_or(Path::new("")).join(&target)
     } else {
         target
+    })
+}
+
+fn keg_name_from_symlink(dst: &Path) -> Option<String> {
+    let resolved = resolve_link_target(dst)?;
+    match fs::canonicalize(&resolved) {
+        Ok(canonical) => keg_name_from_path(&canonical),
+        // Dangling link (e.g. the keg it pointed into was removed): the
+        // target path still identifies the owning keg.
+        Err(_) => keg_name_from_path(&normalize_lexically(&resolved)),
+    }
+}
+
+/// Whether the symlink at `dst` may be silently replaced by a link to `src`.
+///
+/// Regression guard for #331 (https://github.com/lucasgelfond/zerobrew/issues/331):
+/// upgrades and reinstalls used to report the previous version's symlinks as
+/// conflicts "belonging to" the formula itself, leaving the prefix pointing at
+/// the old keg. A link is replaceable when it belongs to another version of
+/// the same keg, or when its target no longer exists (dead links block fresh
+/// installs but protect nothing).
+fn can_replace_existing_link(src: &Path, dst: &Path) -> bool {
+    let Some(resolved) = resolve_link_target(dst) else {
+        return false;
     };
-    let canonical = fs::canonicalize(&resolved).ok()?;
-    keg_name_from_path(&canonical)
+    if !resolved.exists() {
+        return true;
+    }
+    match (keg_name_from_symlink(dst), keg_name_from_path(src)) {
+        (Some(old_owner), Some(new_owner)) => old_owner == new_owner,
+        _ => false,
+    }
 }
 
 impl Linker {
@@ -137,6 +243,9 @@ impl Linker {
                     if fs::canonicalize(&resolved).ok() == fs::canonicalize(&src_path).ok() {
                         continue;
                     }
+                    if can_replace_existing_link(&src_path, &dst_path) {
+                        continue;
+                    }
                 }
                 conflicts.push(ConflictedLink {
                     path: dst_path.clone(),
@@ -165,9 +274,14 @@ impl Linker {
             Err(_) => return,
         };
         for entry in new_entries.flatten() {
+            let file_name = entry.file_name();
+            if should_skip_link_entry(src, &file_name) {
+                continue;
+            }
+
             let src_path = entry.path();
-            let matching_old = old_target.join(entry.file_name());
-            let dst_path = dst.join(entry.file_name());
+            let matching_old = old_target.join(&file_name);
+            let dst_path = dst.join(&file_name);
 
             if src_path.is_dir() {
                 if matching_old.exists() {
@@ -181,6 +295,14 @@ impl Linker {
             if matching_old.exists()
                 && fs::canonicalize(&matching_old).ok() != fs::canonicalize(&src_path).ok()
             {
+                // Another version of the same keg (upgrade through a legacy
+                // whole-directory symlink) will be replaced during linking.
+                let old_owner = fs::canonicalize(&matching_old)
+                    .ok()
+                    .and_then(|p| keg_name_from_path(&p));
+                if old_owner.is_some() && old_owner == keg_name_from_path(&src_path) {
+                    continue;
+                }
                 conflicts.push(ConflictedLink {
                     path: dst_path,
                     owned_by: keg_name_from_symlink(dst).or_else(|| keg_name_from_path(old_target)),
@@ -224,10 +346,19 @@ impl Linker {
             // into individual file symlinks instead of conflicting.
             if src_path.is_dir() {
                 if dst_path.symlink_metadata().is_ok() && dst_path.is_symlink() {
-                    let old_target = fs::read_link(&dst_path)
+                    let target = fs::read_link(&dst_path)
                         .map_err(Error::store("failed to read symlink target"))?;
+                    let old_target = if target.is_relative() {
+                        dst_path.parent().unwrap_or(Path::new("")).join(&target)
+                    } else {
+                        target
+                    };
                     let _ = fs::remove_file(&dst_path);
-                    Self::link_recursive(&old_target, &dst_path)?;
+                    // A dangling directory symlink (e.g. the old keg was
+                    // removed) has nothing left to expand.
+                    if old_target.exists() {
+                        Self::link_recursive(&old_target, &dst_path)?;
+                    }
                 }
                 linked.extend(Self::link_recursive(&src_path, &dst_path)?);
                 continue;
@@ -250,6 +381,8 @@ impl Linker {
                         } else {
                             let _ = fs::remove_file(&dst_path);
                         }
+                    } else if can_replace_existing_link(&src_path, &dst_path) {
+                        let _ = fs::remove_file(&dst_path);
                     } else {
                         return Err(Error::LinkConflict {
                             conflicts: vec![ConflictedLink {
@@ -353,8 +486,13 @@ impl Linker {
         }
         for entry in fs::read_dir(src).map_err(Error::store("failed to read directory"))? {
             let entry = entry.map_err(Error::store("failed to read directory entry"))?;
+            let file_name = entry.file_name();
+            if should_skip_link_entry(src, &file_name) {
+                continue;
+            }
+
             let src_path = entry.path();
-            let dst_path = dst.join(entry.file_name());
+            let dst_path = dst.join(file_name);
 
             if src_path.is_dir() && dst_path.is_dir() && !dst_path.is_symlink() {
                 linked.extend(Self::collect_linked_recursive(&src_path, &dst_path)?);
@@ -519,18 +657,38 @@ mod tests {
         let linker = Linker::new(prefix).unwrap();
 
         let keg1 = prefix.join("cellar/ranger/1.0.0");
-        fs::create_dir_all(keg1.join("libexec")).unwrap();
+        fs::create_dir_all(keg1.join("libexec/bin")).unwrap();
         fs::create_dir_all(keg1.join("bin")).unwrap();
         fs::write(keg1.join("libexec/.gitignore"), b"# ranger").unwrap();
         fs::write(keg1.join("libexec/pyvenv.cfg"), b"home=/tmp/ranger").unwrap();
+        fs::write(
+            keg1.join("libexec/bin/sqlformat"),
+            b"#!/bin/sh\necho sqlformat",
+        )
+        .unwrap();
+        fs::set_permissions(
+            keg1.join("libexec/bin/sqlformat"),
+            PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         fs::write(keg1.join("bin/ranger"), b"#!/bin/sh\necho ranger").unwrap();
         fs::set_permissions(keg1.join("bin/ranger"), PermissionsExt::from_mode(0o755)).unwrap();
 
         let keg2 = prefix.join("cellar/ansible-lint/1.0.0");
-        fs::create_dir_all(keg2.join("libexec")).unwrap();
+        fs::create_dir_all(keg2.join("libexec/bin")).unwrap();
         fs::create_dir_all(keg2.join("bin")).unwrap();
         fs::write(keg2.join("libexec/.gitignore"), b"# ansible-lint").unwrap();
         fs::write(keg2.join("libexec/pyvenv.cfg"), b"home=/tmp/ansible-lint").unwrap();
+        fs::write(
+            keg2.join("libexec/bin/sqlformat"),
+            b"#!/bin/sh\necho sqlformat",
+        )
+        .unwrap();
+        fs::set_permissions(
+            keg2.join("libexec/bin/sqlformat"),
+            PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         fs::write(
             keg2.join("bin/ansible-lint"),
             b"#!/bin/sh\necho ansible-lint",
@@ -545,13 +703,149 @@ mod tests {
         linker.link_keg(&keg1).unwrap();
         linker.link_keg(&keg2).unwrap();
 
-        // Metadata files should not be linked into shared prefix/libexec.
+        // Nothing inside a virtualenv libexec/ should be linked into the
+        // shared prefix — neither metadata files nor libexec/bin/ entries.
         assert!(!prefix.join("libexec/.gitignore").exists());
         assert!(!prefix.join("libexec/pyvenv.cfg").exists());
+        assert!(
+            !prefix.join("libexec/bin/sqlformat").exists(),
+            "libexec/bin/ entries from a venv keg must not leak into shared prefix"
+        );
 
         // Useful entrypoints still link correctly.
         assert!(prefix.join("bin/ranger").exists());
         assert!(prefix.join("bin/ansible-lint").exists());
+    }
+
+    #[test]
+    fn skips_libexec_python_site_packages_to_avoid_virtualenv_conflicts() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        let keg1 = prefix.join("cellar/visidata/1.0.0");
+        fs::create_dir_all(keg1.join("bin")).unwrap();
+        fs::write(keg1.join("bin/visidata"), b"#!/bin/sh\necho visidata").unwrap();
+        fs::set_permissions(keg1.join("bin/visidata"), PermissionsExt::from_mode(0o755)).unwrap();
+
+        for lib_dir in ["lib", "lib64"] {
+            let site_packages = keg1
+                .join("libexec")
+                .join(lib_dir)
+                .join("python3.14/site-packages");
+            fs::create_dir_all(site_packages.join("six-1.17.0.dist-info/licenses")).unwrap();
+            fs::write(site_packages.join("six.py"), b"visidata six").unwrap();
+            fs::write(
+                site_packages.join("six-1.17.0.dist-info/licenses/LICENSE"),
+                b"license",
+            )
+            .unwrap();
+        }
+
+        let public_site_packages = keg1.join("lib/python3.14/site-packages");
+        fs::create_dir_all(&public_site_packages).unwrap();
+        fs::write(public_site_packages.join("public.py"), b"public").unwrap();
+
+        let keg2 = prefix.join("cellar/thefuck/1.0.0");
+        fs::create_dir_all(keg2.join("bin")).unwrap();
+        fs::write(keg2.join("bin/thefuck"), b"#!/bin/sh\necho thefuck").unwrap();
+        fs::set_permissions(keg2.join("bin/thefuck"), PermissionsExt::from_mode(0o755)).unwrap();
+
+        for lib_dir in ["lib", "lib64"] {
+            let site_packages = keg2
+                .join("libexec")
+                .join(lib_dir)
+                .join("python3.14/site-packages");
+            fs::create_dir_all(site_packages.join("six-1.17.0.dist-info/licenses")).unwrap();
+            fs::write(site_packages.join("six.py"), b"thefuck six").unwrap();
+            fs::write(
+                site_packages.join("six-1.17.0.dist-info/licenses/LICENSE"),
+                b"license",
+            )
+            .unwrap();
+        }
+
+        linker.link_keg(&keg1).unwrap();
+
+        assert!(prefix.join("bin/visidata").exists());
+        assert!(
+            prefix
+                .join("lib/python3.14/site-packages/public.py")
+                .exists()
+        );
+        assert!(
+            !prefix
+                .join("libexec/lib/python3.14/site-packages/six.py")
+                .exists()
+        );
+        assert!(
+            !prefix
+                .join("libexec/lib64/python3.14/site-packages/six.py")
+                .exists()
+        );
+
+        assert!(linker.check_conflicts(&keg2).is_ok());
+        linker.link_keg(&keg2).unwrap();
+
+        assert!(prefix.join("bin/thefuck").exists());
+        assert!(
+            !prefix
+                .join("libexec/lib/python3.14/site-packages/six.py")
+                .exists()
+        );
+        assert!(
+            !prefix
+                .join("libexec/lib64/python3.14/site-packages/six.py")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn two_python_virtualenv_kegs_with_shared_dep_names_install_without_conflict() {
+        // Regression test for #377 (https://github.com/lucasgelfond/zerobrew/issues/377):
+        // installing two Python CLI apps (mycli, pgcli) failed because shared
+        // transitive deps (sqlformat, pygmentize) live in each keg's libexec/bin/
+        // and previously got merged into the shared prefix/libexec/bin/, colliding
+        // on the second install.
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        for name in ["mycli", "pgcli"] {
+            let keg = prefix.join(format!("cellar/{name}/1.0.0"));
+            fs::create_dir_all(keg.join("bin")).unwrap();
+            fs::create_dir_all(keg.join("libexec/bin")).unwrap();
+            fs::write(keg.join("libexec/pyvenv.cfg"), b"home=/tmp").unwrap();
+
+            // Main entry point: bin/<name> -> ../libexec/bin/<name>, matching
+            // Homebrew's virtualenv keg layout.
+            std::os::unix::fs::symlink(
+                format!("../libexec/bin/{name}"),
+                keg.join(format!("bin/{name}")),
+            )
+            .unwrap();
+
+            for exe in [name, "sqlformat", "pygmentize"] {
+                let p = keg.join("libexec/bin").join(exe);
+                fs::write(&p, b"#!/bin/sh\necho dep").unwrap();
+                fs::set_permissions(&p, PermissionsExt::from_mode(0o755)).unwrap();
+            }
+        }
+
+        let mycli = prefix.join("cellar/mycli/1.0.0");
+        let pgcli = prefix.join("cellar/pgcli/1.0.0");
+
+        linker.link_keg(&mycli).unwrap();
+        assert!(
+            linker.check_conflicts(&pgcli).is_ok(),
+            "pgcli must not conflict with mycli on shared libexec/bin/ deps"
+        );
+        linker.link_keg(&pgcli).unwrap();
+
+        assert!(prefix.join("bin/mycli").exists());
+        assert!(prefix.join("bin/pgcli").exists());
+        assert!(!prefix.join("libexec/bin/sqlformat").exists());
+        assert!(!prefix.join("libexec/bin/pygmentize").exists());
     }
 
     #[test]
@@ -698,5 +992,179 @@ mod tests {
         linker.link_keg(&keg1).unwrap();
         // Pre-flight check should pass since the files don't overlap
         assert!(linker.check_conflicts(&keg2).is_ok());
+    }
+
+    #[test]
+    fn upgrade_relinks_same_formula_to_new_version() {
+        // Regression test for #331 (https://github.com/lucasgelfond/zerobrew/issues/331):
+        // installing a newer version of an already-linked formula reported the
+        // old version's symlinks as conflicts "belonging to" the formula
+        // itself, so the prefix kept pointing at the old keg forever.
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        let old_keg = prefix.join("cellar/gh/1.0.0");
+        fs::create_dir_all(old_keg.join("bin")).unwrap();
+        fs::create_dir_all(old_keg.join("share/man/man1")).unwrap();
+        fs::write(old_keg.join("bin/gh"), b"old").unwrap();
+        fs::write(old_keg.join("share/man/man1/gh.1"), b"old man").unwrap();
+        linker.link_keg(&old_keg).unwrap();
+
+        let new_keg = prefix.join("cellar/gh/2.0.0");
+        fs::create_dir_all(new_keg.join("bin")).unwrap();
+        fs::create_dir_all(new_keg.join("share/man/man1")).unwrap();
+        fs::write(new_keg.join("bin/gh"), b"new").unwrap();
+        fs::write(new_keg.join("share/man/man1/gh.1"), b"new man").unwrap();
+
+        assert!(
+            linker.check_conflicts(&new_keg).is_ok(),
+            "another version of the same formula must not count as a conflict"
+        );
+        linker.link_keg(&new_keg).unwrap();
+
+        for link in ["bin/gh", "share/man/man1/gh.1"] {
+            let target = fs::read_link(prefix.join(link)).unwrap();
+            let target = target.to_string_lossy();
+            assert!(
+                target.contains("2.0.0"),
+                "{link} must point at 2.0.0, got {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn relinks_when_old_keg_directory_was_removed() {
+        // #331 fallout: an upgrade that removed the old keg but died before
+        // relinking leaves dangling same-formula symlinks; the next install
+        // must replace them instead of conflicting.
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        let old_keg = setup_keg(&tmp, "foo");
+        linker.link_keg(&old_keg).unwrap();
+        fs::remove_dir_all(&old_keg).unwrap();
+        assert!(prefix.join("bin/foo").is_symlink());
+
+        let new_keg = prefix.join("cellar/foo/2.0.0");
+        fs::create_dir_all(new_keg.join("bin")).unwrap();
+        fs::write(new_keg.join("bin/foo"), b"new").unwrap();
+
+        assert!(linker.check_conflicts(&new_keg).is_ok());
+        linker.link_keg(&new_keg).unwrap();
+
+        let target = fs::read_link(prefix.join("bin/foo")).unwrap();
+        assert!(target.to_string_lossy().contains("2.0.0"));
+        assert!(prefix.join("bin/foo").exists(), "link must not be dangling");
+    }
+
+    #[test]
+    fn replaces_dangling_symlink_from_other_formula() {
+        // Orphaned links whose keg no longer exists (#188 fallout) used to
+        // block unrelated installs with phantom conflicts. A dead link
+        // protects nothing and is safe to replace.
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        std::os::unix::fs::symlink(
+            prefix.join("cellar/ghost/1.0.0/bin/tool"),
+            prefix.join("bin/tool"),
+        )
+        .unwrap();
+
+        let keg = prefix.join("cellar/tool/1.0.0");
+        fs::create_dir_all(keg.join("bin")).unwrap();
+        fs::write(keg.join("bin/tool"), b"real").unwrap();
+
+        assert!(linker.check_conflicts(&keg).is_ok());
+        linker.link_keg(&keg).unwrap();
+
+        let target = fs::read_link(prefix.join("bin/tool")).unwrap();
+        assert!(target.to_string_lossy().contains("cellar/tool/1.0.0"));
+    }
+
+    #[test]
+    fn live_symlink_from_other_formula_still_conflicts() {
+        // Replacement is limited to same-formula and dead links; a live link
+        // owned by a different formula must keep failing all-or-none.
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        let keg1 = setup_keg(&tmp, "alpha");
+        linker.link_keg(&keg1).unwrap();
+
+        let keg2 = prefix.join("cellar/beta/1.0.0");
+        fs::create_dir_all(keg2.join("bin")).unwrap();
+        fs::write(keg2.join("bin/alpha"), b"other").unwrap();
+
+        let result = linker.check_conflicts(&keg2);
+        assert!(result.is_err());
+        if let Err(Error::LinkConflict { conflicts }) = result {
+            assert_eq!(conflicts[0].owned_by.as_deref(), Some("alpha"));
+        }
+        assert!(linker.link_keg(&keg2).is_err());
+        let target = fs::read_link(prefix.join("bin/alpha")).unwrap();
+        assert!(target.to_string_lossy().contains("alpha/1.0.0"));
+    }
+
+    #[test]
+    fn upgrade_expands_legacy_directory_symlink_owned_by_same_formula() {
+        // Whole-directory symlinks left by older layouts must be expanded and
+        // replaced when the owning formula is upgraded, not reported as a
+        // conflict for every file inside.
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        let old_keg = prefix.join("cellar/foo/1.0.0");
+        fs::create_dir_all(old_keg.join("share/doc/foo")).unwrap();
+        fs::write(old_keg.join("share/doc/foo/README"), b"old").unwrap();
+        fs::create_dir_all(prefix.join("share/doc")).unwrap();
+        std::os::unix::fs::symlink(old_keg.join("share/doc/foo"), prefix.join("share/doc/foo"))
+            .unwrap();
+
+        let new_keg = prefix.join("cellar/foo/2.0.0");
+        fs::create_dir_all(new_keg.join("share/doc/foo")).unwrap();
+        fs::write(new_keg.join("share/doc/foo/README"), b"new").unwrap();
+
+        assert!(linker.check_conflicts(&new_keg).is_ok());
+        linker.link_keg(&new_keg).unwrap();
+
+        let readme = prefix.join("share/doc/foo/README");
+        let target = fs::read_link(&readme).unwrap();
+        assert!(target.to_string_lossy().contains("2.0.0"));
+    }
+
+    #[test]
+    fn dangling_directory_symlink_is_replaced() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        std::os::unix::fs::symlink(
+            prefix.join("cellar/foo/0.9.0/share/foo"),
+            prefix.join("share/foo"),
+        )
+        .unwrap();
+
+        let keg = prefix.join("cellar/foo/1.0.0");
+        fs::create_dir_all(keg.join("share/foo")).unwrap();
+        fs::write(keg.join("share/foo/data.txt"), b"data").unwrap();
+
+        assert!(linker.check_conflicts(&keg).is_ok());
+        linker.link_keg(&keg).unwrap();
+
+        assert!(prefix.join("share/foo/data.txt").exists());
+    }
+
+    #[test]
+    fn keg_name_from_symlink_attributes_dangling_links() {
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("gh");
+        std::os::unix::fs::symlink(tmp.path().join("cellar/gh/1.0.0/bin/gh"), &link).unwrap();
+        assert_eq!(keg_name_from_symlink(&link).as_deref(), Some("gh"));
     }
 }

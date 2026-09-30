@@ -92,6 +92,20 @@ impl UsesFromMacos {
             UsesFromMacos::WithContext { name, .. } => name,
         }
     }
+
+    pub fn is_runtime_dependency(&self) -> bool {
+        match self {
+            UsesFromMacos::Plain(_) => true,
+            UsesFromMacos::WithContext { context, .. } => context == "runtime",
+        }
+    }
+
+    pub fn is_build_dependency(&self) -> bool {
+        match self {
+            UsesFromMacos::Plain(_) => false,
+            UsesFromMacos::WithContext { context, .. } => context == "build",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -132,9 +146,6 @@ impl Formula {
     }
 
     pub fn is_keg_only(&self) -> bool {
-        if self.name.contains('@') {
-            return true;
-        }
         if matches!(self.keg_only, KegOnly::No) {
             return false;
         }
@@ -160,12 +171,100 @@ impl Formula {
         #[cfg(not(target_os = "macos"))]
         let deps = {
             let mut deps = deps;
-            for u in &self.uses_from_macos {
-                deps.push(u.name().to_string());
+            for u in self.active_uses_from_macos() {
+                push_unique_dep(&mut deps, u.name());
             }
             deps
         };
         deps
+    }
+
+    pub fn runtime_dependencies(&self) -> Vec<String> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut deps = self.platform_dependencies();
+            for dep in self
+                .active_uses_from_macos()
+                .iter()
+                .filter(|dep| dep.is_runtime_dependency())
+            {
+                push_unique_dep(&mut deps, dep.name());
+            }
+            deps
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.platform_dependencies()
+        }
+    }
+
+    fn platform_dependencies(&self) -> Vec<String> {
+        #[cfg(target_os = "linux")]
+        if let Some(deps) = self.variation_dependencies(preferred_linux_variation_keys()) {
+            return deps;
+        }
+
+        self.dependencies.clone()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn variation_dependencies(&self, keys: &[&str]) -> Option<Vec<String>> {
+        let variations = self.variations.as_ref()?.as_object()?;
+        for key in keys {
+            if let Some(deps) = variations
+                .get(*key)
+                .and_then(|variation| variation.get("dependencies"))
+                .and_then(|deps| deps.as_array())
+            {
+                return Some(
+                    deps.iter()
+                        .filter_map(|dep| dep.as_str().map(ToString::to_string))
+                        .collect(),
+                );
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn active_uses_from_macos(&self) -> Vec<UsesFromMacos> {
+        #[cfg(target_os = "linux")]
+        if let Some(deps) = self.variation_uses_from_macos(preferred_linux_variation_keys()) {
+            return deps;
+        }
+
+        self.uses_from_macos.clone()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn variation_uses_from_macos(&self, keys: &[&str]) -> Option<Vec<UsesFromMacos>> {
+        let variations = self.variations.as_ref()?.as_object()?;
+        for key in keys {
+            if let Some(value) = variations
+                .get(*key)
+                .and_then(|variation| variation.get("uses_from_macos"))
+            {
+                return serde_json::from_value(value.clone()).ok();
+            }
+        }
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn push_unique_dep(deps: &mut Vec<String>, name: &str) {
+    if !deps.iter().any(|existing| existing == name) {
+        deps.push(name.to_string());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn preferred_linux_variation_keys() -> &'static [&'static str] {
+    match std::env::consts::ARCH {
+        "aarch64" => &["arm64_linux", "aarch64_linux"],
+        "x86_64" => &["x86_64_linux"],
+        _ => &[],
     }
 }
 
@@ -192,6 +291,10 @@ pub struct BottleStable {
 pub struct BottleFile {
     pub url: String,
     pub sha256: String,
+    /// Where Homebrew expects the bottle to be poured: `:any`,
+    /// `:any_skip_relocation`, or a fixed Cellar such as `/opt/homebrew/Cellar`.
+    #[serde(default)]
+    pub cellar: Option<String>,
 }
 
 #[cfg(test)]
@@ -291,21 +394,6 @@ mod tests {
         assert!(
             matches!(formula.keg_only, KegOnly::Reason(ref s) if s == "it conflicts with PostgreSQL")
         );
-        assert!(formula.is_keg_only());
-    }
-
-    #[test]
-    fn versioned_formula_is_keg_only() {
-        let json = r#"{
-            "name": "postgresql@15",
-            "versions": { "stable": "15.8" },
-            "dependencies": [],
-            "bottle": { "stable": { "files": {
-                "arm64_sonoma": { "url": "https://x.com/a.tar.gz", "sha256": "aa" }
-            }}}
-        }"#;
-        let formula: Formula = serde_json::from_str(json).unwrap();
-        assert_eq!(formula.keg_only, KegOnly::No);
         assert!(formula.is_keg_only());
     }
 
@@ -410,5 +498,106 @@ mod tests {
         let formula: Formula = serde_json::from_str(json).unwrap();
         assert!(formula.keg_only_reason.is_none());
         assert!(formula.is_keg_only());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn runtime_dependencies_include_runtime_uses_from_macos_on_linux() {
+        let mut formula: Formula =
+            serde_json::from_str(include_str!("../../fixtures/formula_foo.json")).unwrap();
+        formula.dependencies = vec!["openssl@3".to_string()];
+        formula.uses_from_macos = vec![
+            UsesFromMacos::Plain("expat".to_string()),
+            UsesFromMacos::WithContext {
+                name: "pkgconf".to_string(),
+                context: "build".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            formula.runtime_dependencies(),
+            vec!["openssl@3".to_string(), "expat".to_string()]
+        );
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn runtime_dependencies_use_linux_variation_dependencies() {
+        let mut formula: Formula =
+            serde_json::from_str(include_str!("../../fixtures/formula_foo.json")).unwrap();
+        formula.dependencies = vec!["openssl@3".to_string()];
+        formula.variations = Some(serde_json::json!({
+            "x86_64_linux": { "dependencies": ["openssl@3", "zlib-ng-compat"] },
+            "arm64_linux": { "dependencies": ["openssl@3", "zlib-ng-compat"] }
+        }));
+        formula.uses_from_macos = vec![UsesFromMacos::Plain("expat".to_string())];
+
+        assert_eq!(
+            formula.runtime_dependencies(),
+            vec![
+                "openssl@3".to_string(),
+                "zlib-ng-compat".to_string(),
+                "expat".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn runtime_dependencies_include_linux_variation_uses_from_macos() {
+        let mut formula: Formula =
+            serde_json::from_str(include_str!("../../fixtures/formula_foo.json")).unwrap();
+        formula.dependencies = vec!["openssl@3".to_string()];
+        formula.uses_from_macos = vec![UsesFromMacos::Plain("expat".to_string())];
+        formula.variations = Some(serde_json::json!({
+            "x86_64_linux": {
+                "dependencies": ["openssl@3", "zlib-ng-compat"],
+                "uses_from_macos": ["libffi", { "pkgconf": "build" }]
+            },
+            "arm64_linux": {
+                "dependencies": ["openssl@3", "zlib-ng-compat"],
+                "uses_from_macos": ["libffi", { "pkgconf": "build" }]
+            }
+        }));
+
+        assert_eq!(
+            formula.runtime_dependencies(),
+            vec![
+                "openssl@3".to_string(),
+                "zlib-ng-compat".to_string(),
+                "libffi".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn bottle_file_cellar_deserializes() {
+        let json = r#"{
+            "name": "foo",
+            "versions": { "stable": "1.0" },
+            "dependencies": [],
+            "bottle": { "stable": { "files": {
+                "arm64_tahoe": { "url": "https://x.com/a.tar.gz", "sha256": "aa", "cellar": "/opt/homebrew/Cellar" },
+                "arm64_sequoia": { "url": "https://x.com/b.tar.gz", "sha256": "bb", "cellar": ":any_skip_relocation" },
+                "arm64_sonoma": { "url": "https://x.com/c.tar.gz", "sha256": "cc" }
+            }}}
+        }"#;
+        let formula: Formula = serde_json::from_str(json).unwrap();
+        let files = &formula.bottle.stable.files;
+        assert_eq!(
+            files["arm64_tahoe"].cellar.as_deref(),
+            Some("/opt/homebrew/Cellar")
+        );
+        assert_eq!(
+            files["arm64_sequoia"].cellar.as_deref(),
+            Some(":any_skip_relocation")
+        );
+        assert_eq!(files["arm64_sonoma"].cellar, None);
     }
 }

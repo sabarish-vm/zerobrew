@@ -6,19 +6,75 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-### Added
-- Chinese translation of the README ([#315](https://github.com/lucasgelfond/zerobrew/pull/316))
-- Regex matches on `/Cellar/<pkg>/)([^/]+)(/)`, so it only matches version segments within Cellar-style paths ([#317](https://github.com/lucasgelfond/zerobrew/pull/317))
+
+### Changed
+- Homebrew installs now use the `cachebag/zerobrew` tap, which is updated automatically for every release. The old `lucasgelfond/zerobrew` tap was stuck at v0.1.1 ([#386](https://github.com/lucasgelfond/zerobrew/issues/386))
+- On Intel Macs, bottles pinned to `/usr/local` are built from source instead of being installed with paths that can't be rewritten for `/opt/zerobrew`, matching Homebrew ([#286](https://github.com/lucasgelfond/zerobrew/issues/286))
+
+### Fixed
+- Install the default config files bottles ship in `etc` and `var` (such as `php.ini` and `openssl.cnf`) into the prefix, keeping any edits and writing new defaults alongside as `<name>.default` ([#390](https://github.com/lucasgelfond/zerobrew/issues/390))
+- Replace Homebrew placeholders in scripts that contain binary data and recompute PHP archive signatures afterwards, which broke `composer` on macOS ([#389](https://github.com/lucasgelfond/zerobrew/issues/389))
+- Only rewrite the Homebrew prefix a bottle was built with, so `/usr/local` paths on Apple Silicon are no longer rewritten or reported as unrelocatable ([#286](https://github.com/lucasgelfond/zerobrew/issues/286))
+- Report `install_name_tool` failures instead of ignoring them, and keep entitlements and hardened runtime flags when re-signing patched binaries ([#300](https://github.com/lucasgelfond/zerobrew/issues/300))
+- Text files that aren't valid UTF-8 now get their Homebrew placeholders replaced
+
+## [0.3.3] - 2026-09-29
+
+### Changed
+- Bump MSRV to 1.96, required to build the latest `cargo-audit` in CI ([#393](https://github.com/lucasgelfond/zerobrew/pull/393))
+- Refresh `Cargo.lock` for audit findings: `crossbeam-epoch` (RUSTSEC-2026-0204), `quinn-proto` (RUSTSEC-2026-0185), and `anyhow` (RUSTSEC-2026-0190) ([#393](https://github.com/lucasgelfond/zerobrew/pull/393))
+- Update `h2` to resolve a `cargo audit` finding
+
+### Fixed
+- Respect Homebrew's `keg_only` field for versioned formulae instead of treating every `@` formula as keg-only, so formulae like `python@3.x` and `gcc@N` are linked like they are in Homebrew ([#403](https://github.com/lucasgelfond/zerobrew/pull/403))
+- Fix the build on macOS 27 by bumping `reqwest`
+- Relink on upgrade/reinstall: symlinks owned by another version of the same formula — including dangling links left behind by removed kegs — are now replaced during linking instead of failing the link step as conflicts with the formula itself, which left `bin`/`opt` pointing at the old version while the DB reported the new one ([#393](https://github.com/lucasgelfond/zerobrew/pull/393))
+
+## [0.3.2] - 2026-06-11
+
+### Security
+- Verify SHA-256 checksums for resource and URL patch downloads in the formula build shim before extraction or application (CVE-2026-53970)
+
+## [0.3.1] - 2026-05-30
+
+### Fixed
+- Centralize a single, sandbox-tolerant rustls `ClientConfig` in `network::tls`: prefer native roots, and fall back to the bundled webpki-roots Mozilla roots when no system trust store is available ([#375](https://github.com/lucasgelfond/zerobrew/pull/375))
+- Correct migration behavior on unplannable formulas ([#380](https://github.com/lucasgelfond/zerobrew/pull/380))
+
+### Changed
+- Clarify standalone installer shell setup and update flow: surface `zb init` output, print shell-specific reload commands after shell config changes, print exact `export`/fish commands for `--no-modify-path`, report installed/updated/already-current status on reruns, and warn when an older `zb` still appears earlier in `PATH` ([#381](https://github.com/lucasgelfond/zerobrew/pull/381))
+- Clarify `zb update` help/output and README update docs so users know `zb update` refreshes package metadata while the installer or Homebrew updates the `zb` binary itself ([#381](https://github.com/lucasgelfond/zerobrew/pull/381))
+
+## [0.3.0] - 2026-05-29
 
 ### Added
-- `zb doctor` command with `--repair` flag for state diagnosis and recovery ([#314](https://github.com/lucasgelfond/zerobrew/pull/314))
+- Eleventy-based homepage with responsive styling, interactive panels, benchmark/install content, and site assets ([#309](https://github.com/lucasgelfond/zerobrew/pull/309))
+- `zb doctor` command with `--repair` flag for state diagnosis, recovery, orphaned store entries, and broken symlinks ([#314](https://github.com/lucasgelfond/zerobrew/pull/314))
+- Chinese translation of the README ([#316](https://github.com/lucasgelfond/zerobrew/pull/316))
+- `zb upgrade` command to upgrade installed packages, with `--build-from-source` and `--no-link` flags; supports upgrading all outdated packages or specific ones by name ([#369](https://github.com/lucasgelfond/zerobrew/pull/369))
 
 ### Fixed
 - Validate root/prefix paths before passing to sudo to prevent shell injection ([#311](https://github.com/lucasgelfond/zerobrew/pull/311))
+- Regex matches only version segments within Cellar-style paths when patching Mach-O binary strings ([#317](https://github.com/lucasgelfond/zerobrew/pull/317))
+- Update vulnerable `aws-lc-sys`, `aws-lc-rs`, and `rustls-webpki` dependencies ([#318](https://github.com/lucasgelfond/zerobrew/pull/318))
+- Make `just fmt` apply formatting and document the workflow ([#319](https://github.com/lucasgelfond/zerobrew/pull/319))
+- Resolve formula aliases and oldnames after API 404s ([#332](https://github.com/lucasgelfond/zerobrew/pull/332))
+- Skip linking `libexec` Python `site-packages` paths to avoid conflicts ([#368](https://github.com/lucasgelfond/zerobrew/pull/368))
+- Make `zb upgrade` clean old cellar metadata, stay idempotent after download failures, and exit non-zero for missing requested packages ([#369](https://github.com/lucasgelfond/zerobrew/pull/369))
+- Ignore stale macOS prefix environment defaults when initializing or resolving paths ([#372](https://github.com/lucasgelfond/zerobrew/pull/372))
+- Resolve Linux `uses_from_macos` dependencies, rewrite Linuxbrew bottle paths, and restrict Linux bottle fallback by architecture ([#373](https://github.com/lucasgelfond/zerobrew/pull/373))
 
 ### Changed
 - Split monolithic install module into focused submodules ([#312](https://github.com/lucasgelfond/zerobrew/pull/312))
 - Split monolithic download module into focused submodules ([#313](https://github.com/lucasgelfond/zerobrew/pull/313))
+- Document Homebrew tap installation as an alternative install method ([#325](https://github.com/lucasgelfond/zerobrew/pull/325))
+- Refresh dependency lockfile entries ([#330](https://github.com/lucasgelfond/zerobrew/pull/330))
+- Make migration install only leaf formulae from Homebrew ([#333](https://github.com/lucasgelfond/zerobrew/pull/333))
+- Prefer direct Homebrew install instructions in README files ([#337](https://github.com/lucasgelfond/zerobrew/pull/337))
+- Refresh `Cargo.lock` for audit findings ([#345](https://github.com/lucasgelfond/zerobrew/pull/345), [#363](https://github.com/lucasgelfond/zerobrew/pull/363))
+- Pin release workflow Ubuntu runners to 22.04 for stability ([#352](https://github.com/lucasgelfond/zerobrew/pull/352))
+- Add CLI help text for command arguments and flags ([#355](https://github.com/lucasgelfond/zerobrew/pull/355))
+- Add and then revert the security scanning workflow ([#354](https://github.com/lucasgelfond/zerobrew/pull/354), [#358](https://github.com/lucasgelfond/zerobrew/pull/358))
 
 
 ## [0.2.1] - 2026-03-14
@@ -90,7 +146,11 @@ To get an idea of the initial features zerobrew supports, take a look at the [RE
 
 See the [full commit history](https://github.com/lucasgelfond/zerobrew/commits/v0.1.1) for more details.
 
-[Unreleased]: https://github.com/lucasgelfond/zerobrew/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/lucasgelfond/zerobrew/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/lucasgelfond/zerobrew/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/lucasgelfond/zerobrew/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/lucasgelfond/zerobrew/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/lucasgelfond/zerobrew/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/lucasgelfond/zerobrew/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lucasgelfond/zerobrew/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/lucasgelfond/zerobrew/compare/v0.1.1...v0.1.2
